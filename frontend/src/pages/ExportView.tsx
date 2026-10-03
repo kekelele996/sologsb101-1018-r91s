@@ -39,7 +39,7 @@ import { useCoatStore } from '@/stores/coatStore';
 import { useRoomStore } from '@/stores/roomStore';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
-import { ROOM_VERDICT_LABEL } from '@/types/room';
+import { ROOM_SOURCE_LABEL, ROOM_VERDICT_LABEL } from '@/types/room';
 import {
   INSPECT_VERDICT_COLOR,
   INSPECT_VERDICT_LABEL,
@@ -72,7 +72,8 @@ export default function ExportView() {
   const loadBodies = useBodyStore((state) => state.loadBodies);
   const coats = useCoatStore((state) => state.coats);
   const loadCoats = useCoatStore((state) => state.loadCoats);
-  const rooms = useRoomStore((state) => state.rooms);
+  const rooms = useRoomStore((state) => state.readings);
+  const roomStays = useRoomStore((state) => state.stays);
   const loadRooms = useRoomStore((state) => state.loadRooms);
 
   const [open, setOpen] = useState(false);
@@ -97,9 +98,7 @@ export default function ExportView() {
   const reworkText = useMemo(
     () => buildReworkList(bodies, coats, rooms, inspectTable.rows),
     [bodies, coats, rooms, inspectTable.rows],
-  );
-
-  const openCreate = (): void => {
+  );  const openCreate = (): void => {
     const bodyId = bodies[0]?.id ?? '';
     if (!bodyId) {
       message.warning('请先在胎体台账中登记胎体');
@@ -223,14 +222,14 @@ export default function ExportView() {
                       ? `第 ${coat.seq} 道 · ${PAINT_TYPE_LABEL[coat.paintType]} · ${coat.colorName}（${COAT_STATE_LABEL[coat.state]}）`
                       : `第 ${record.defectCoatSeq} 道`;
                   })()}
-              ；荫房：
+              ；荫房读数：
               {record.defectRoomId === null
                 ? '未指定'
                 : (() => {
                     const room = rooms.find((item) => item.id === record.defectRoomId);
                     return room
-                      ? `${room.date} ${room.tempC}℃ / ${room.humidityPct}%（${ROOM_VERDICT_LABEL[room.verdict]}）`
-                      : '记录已删除';
+                      ? `${room.date} ${room.tempC}℃ / ${room.humidityPct}%（${ROOM_VERDICT_LABEL[room.verdict]}·${ROOM_SOURCE_LABEL[room.source]}）`
+                      : '读数已删除';
                   })()}
             </Typography.Text>
           </Space>
@@ -306,7 +305,8 @@ export default function ExportView() {
         <StatBadge label="合格率" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
         <StatBadge label="合格" value={stat.pass} suffix="条" tone="info" />
         <StatBadge label="返工" value={stat.rework} suffix="条" tone="danger" />
-        <StatBadge label="荫房记录" value={rooms.length} suffix="条" tone="warning" />
+        <StatBadge label="记录仪读数" value={rooms.length} suffix="条" tone="warning" />
+        <StatBadge label="出入房时刻" value={roomStays.length} suffix="条" tone="info" />
       </div>
 
       <Row gutter={16}>
@@ -372,7 +372,7 @@ export default function ExportView() {
           <Card title="整库导出" style={{ marginTop: 16 }}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
               <Typography.Text type="secondary">
-                导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+                导出文件包含 7 张业务表全量数据与结构版本号（荫房读数与出入房时刻分开），可在其他设备通过「导入 JSON」还原。
               </Typography.Text>
               <Space wrap>
                 <Button icon={<CloudDownloadOutlined />} onClick={() => void handleExport()}>
@@ -380,7 +380,7 @@ export default function ExportView() {
                 </Button>
                 <Button
                   onClick={() => {
-                    const filename = exportLedgerCsv(bodies, coats, rooms);
+                    const filename = exportLedgerCsv(bodies, coats, rooms, roomStays);
                     message.success(`已导出 ${filename}`);
                   }}
                 >
@@ -454,10 +454,10 @@ export default function ExportView() {
                   }))}
                 />
               </Form.Item>
-              <Form.Item name="defectRoomId" label="关联荫房记录" style={{ flex: 1 }}>
+              <Form.Item name="defectRoomId" label="关联记录仪读数" style={{ flex: 1 }}>
                 <Select
                   allowClear
-                  placeholder="选择荫房记录"
+                  placeholder="选择记录仪读数"
                   options={draftRooms.map((room) => ({
                     value: room.id,
                     label: `${room.date} ${room.tempC}℃/${room.humidityPct}% · ${ROOM_VERDICT_LABEL[room.verdict]}`,

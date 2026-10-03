@@ -28,7 +28,12 @@ interface CoatStoreState {
   removeCoat: (id: string) => Promise<void>;
   batchUpdate: (ids: string[], patch: Partial<Coat>) => Promise<void>;
   advanceState: (id: string) => Promise<void>;
-  markRecheck: (bodyId: string, recheck: boolean) => Promise<void>;
+  /**
+   * 荫房对账结果回写：认下的荫干窗口出现越界读数时，
+   * 该胎体未做完的髹涂道次挂「待复检」，已涂未打磨完的道次退回「待打磨」；
+   * 越界解除（窗口补齐 / 读数改正常）时清除待复检标记。
+   */
+  applyRoomBreach: (bodyId: string, breached: boolean) => Promise<void>;
   reorderCoats: (bodyId: string, orderedIds: string[]) => Promise<void>;
   nextSeq: (bodyId: string) => number;
   /** 同器型自动带出上次漆种与间隔建议 */
@@ -103,12 +108,27 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
     await get().updateCoat(id, { state: next });
   },
 
-  async markRecheck(bodyId, recheck) {
+  async applyRoomBreach(bodyId, breached) {
     const affected = get().coats.filter((coat) => coat.bodyId === bodyId && coat.state !== 'done');
     if (affected.length === 0) return;
     const now = Date.now();
-    await db.coats.bulkPut(affected.map((coat) => ({ ...coat, needRecheck: recheck, updatedAt: now })));
-    await get().loadCoats();
+    const rows: Coat[] = affected.map((coat) => {
+      if (!breached) {
+        // 越界解除：仅清除待复检标记，道次状态不自动回退（是否重新打磨由人工判定）
+        return coat.needRecheck ? { ...coat, needRecheck: false, updatedAt: now } : coat;
+      }
+      // 认下窗口越界：未做完的道次挂待复检；已涂 / 待打磨的道次打磨退回「待打磨」
+      const nextState: Coat['state'] =
+        coat.state === 'coated' || coat.state === 'toPolish' ? 'toPolish' : coat.state;
+      return coat.needRecheck && nextState === coat.state
+        ? coat
+        : { ...coat, needRecheck: true, state: nextState, updatedAt: now };
+    });
+    const changed = rows.some((coat, index) => coat !== affected[index]);
+    if (changed) {
+      await db.coats.bulkPut(rows);
+      await get().loadCoats();
+    }
   },
 
   async reorderCoats(bodyId, orderedIds) {

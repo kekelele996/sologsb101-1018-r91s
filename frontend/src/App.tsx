@@ -33,7 +33,8 @@ export default function App() {
   const loadBodies = useBodyStore((state) => state.loadBodies);
   const coats = useCoatStore((state) => state.coats);
   const loadCoats = useCoatStore((state) => state.loadCoats);
-  const rooms = useRoomStore((state) => state.rooms);
+  const rooms = useRoomStore((state) => state.readings);
+  const roomStays = useRoomStore((state) => state.stays);
   const loadRooms = useRoomStore((state) => state.loadRooms);
 
   useEffect(() => {
@@ -98,7 +99,7 @@ export default function App() {
               <DashboardOutlined /> 胎体 {bodies.length} 件
             </span>
             <span>髹涂道次 {coats.length} 道</span>
-            <span>荫房记录 {rooms.length} 条</span>
+            <span>记录仪读数 {rooms.length} 条 · 出入房时刻 {roomStays.length} 条</span>
           </Space>
         </div>
       </Sider>

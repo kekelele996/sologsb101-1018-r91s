@@ -20,7 +20,7 @@ export interface Inspect {
   date: string;
   /** 返工时定位到的道次序号，无则 null */
   defectCoatSeq: number | null;
-  /** 返工时定位到的荫房记录 id，无则 null */
+  /** 返工时定位到的荫房记录仪读数 id（温湿度认记录仪），无则 null */
   defectRoomId: string | null;
   createdAt: number;
   updatedAt: number;

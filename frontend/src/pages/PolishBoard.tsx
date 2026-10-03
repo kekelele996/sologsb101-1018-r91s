@@ -83,6 +83,9 @@ export default function PolishBoard() {
     [bodyCoats, rows],
   );
 
+  /** 认下荫干窗口越界后退回打磨的道次：挂待复检，需重新打磨 */
+  const recheckCoats = useMemo(() => bodyCoats.filter((coat) => coat.needRecheck), [bodyCoats]);
+
   const stat = bodyId ? progressOf(bodyId) : null;
   const totalMinutes = rows.reduce((sum, row) => sum + row.durationMin, 0);
   const maxGrit = rows.reduce((max, row) => Math.max(max, row.grit), 0);
@@ -146,14 +149,18 @@ export default function PolishBoard() {
     message.success(`已按 ${targets.length} 个道次生成目数序列（${GRIT_SEQUENCE.slice(0, targets.length).join(' / ')}）`);
   };
 
-  /** 打磨完成后把道次推进到已完成 */
+  /** 打磨完成后把道次推进到已完成；仍挂待复检（越界未解除）的道次禁止直接完成 */
   const finishPolish = async (row: Polish): Promise<void> => {
     const coat = bodyCoats.find((item) => item.seq === row.seq);
     if (!coat) {
       message.warning('未找到对应道次');
       return;
     }
-    await updateCoat(coat.id, { state: 'done', needRecheck: false });
+    if (coat.needRecheck) {
+      message.warning(`第 ${row.seq} 道挂待复检（认下荫干窗口越界），请复检确认后再完成打磨`);
+      return;
+    }
+    await updateCoat(coat.id, { state: 'done' });
     message.success(`第 ${row.seq} 道打磨完成，道次已置为已完成`);
   };
 
@@ -251,6 +258,16 @@ export default function PolishBoard() {
       ) : (
         <Alert type="success" showIcon style={{ marginBottom: 14 }} message="当前胎体道次打磨均已闭环，可继续下一道罩漆" />
       )}
+
+      {recheckCoats.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`第 ${recheckCoats.map((coat) => coat.seq).join('、')} 道因认下荫干窗口越界挂待复检，已打磨退回「待打磨」`}
+          description="温湿度认记录仪、出入房时刻认管理员，两侧对账认下后出现越界读数才会回写；请重新打磨复检后再推进。"
+        />
+      ) : null}
 
       <Card className="gb-table-card" styles={{ body: { padding: 0 } }}>
         {rows.length === 0 ? (

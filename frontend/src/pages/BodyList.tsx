@@ -1,7 +1,7 @@
 /**
  * /bodies 胎体与器型台账
  * 新建胎体、按材质与器型筛选（筛选条件同步 URL query），卡片回显道次完成度与最近荫房记录。
- * 消费 Body、Coat、Room；复用 <StageTag>、<EmptyPanel> 与 <StatBadge>。
+ * 消费 Body、Coat、RoomReading / RoomStay；复用 <StageTag>、<EmptyPanel> 与 <StatBadge>。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';

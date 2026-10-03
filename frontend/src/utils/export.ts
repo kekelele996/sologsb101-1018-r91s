@@ -1,14 +1,15 @@
 /**
  * 导出工具：整库 JSON 存档、返工清单文本、编目清单 CSV
  * 全部在浏览器本地完成，不经过任何服务端。
+ * 荫房两类数据分开导出：温湿度取记录仪读数，入房出房时刻取管理员手填。
  */
 import type { Body } from '@/types/body';
 import type { Coat } from '@/types/coat';
-import type { Room } from '@/types/room';
+import type { RoomReading, RoomStay } from '@/types/room';
 import type { Inspect } from '@/types/inspect';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL } from '@/types/body';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
-import { ROOM_VERDICT_LABEL } from '@/types/room';
+import { ROOM_SOURCE_LABEL, ROOM_VERDICT_LABEL } from '@/types/room';
 import { INSPECT_VERDICT_LABEL } from '@/types/inspect';
 import type { LacquerSnapshot } from './db';
 
@@ -45,11 +46,11 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 返工清单：定位到具体道次与荫房记录 */
+/** 返工清单：定位到具体道次与荫房记录仪读数 */
 export function buildReworkList(
   bodies: Body[],
   coats: Coat[],
-  rooms: Room[],
+  readings: RoomReading[],
   inspects: Inspect[],
 ): string {
   const lines: string[] = ['漆器髹涂返工清单', `生成时间：${new Date().toLocaleString('zh-CN')}`, ''];
@@ -61,7 +62,7 @@ export function buildReworkList(
   reworks.forEach((inspect, index) => {
     const body = bodies.find((item) => item.id === inspect.bodyId);
     const coat = coats.find((item) => item.bodyId === inspect.bodyId && item.seq === inspect.defectCoatSeq);
-    const room = rooms.find((item) => item.id === inspect.defectRoomId);
+    const reading = readings.find((item) => item.id === inspect.defectRoomId);
     lines.push(`${index + 1}. ${body ? `${body.code}（${BODY_MATERIAL_LABEL[body.material]}·${BODY_SHAPE_LABEL[body.shape]}）` : inspect.bodyId}`);
     lines.push(`   质检日期：${inspect.date}　质检人：${inspect.inspector || '未填写'}　结论：${INSPECT_VERDICT_LABEL[inspect.verdict]}`);
     lines.push(`   缺陷：${inspect.defectNote || '未填写'}`);
@@ -73,9 +74,9 @@ export function buildReworkList(
       }`,
     );
     lines.push(
-      `   关联荫房：${
-        room
-          ? `${room.date}　${room.tempC}℃ / ${room.humidityPct}%（${ROOM_VERDICT_LABEL[room.verdict]}）`
+      `   关联荫房读数：${
+        reading
+          ? `${reading.date}　${reading.tempC}℃ / ${reading.humidityPct}%（${ROOM_VERDICT_LABEL[reading.verdict]}，来源：${ROOM_SOURCE_LABEL[reading.source]}）`
           : '未指定'
       }`,
     );
@@ -88,25 +89,66 @@ export function buildReworkList(
 export function exportReworkList(
   bodies: Body[],
   coats: Coat[],
-  rooms: Room[],
+  readings: RoomReading[],
   inspects: Inspect[],
 ): string {
   const filename = `漆器返工清单-${stampSuffix()}.txt`;
-  download(filename, buildReworkList(bodies, coats, rooms, inspects), 'text/plain;charset=utf-8');
+  download(filename, buildReworkList(bodies, coats, readings, inspects), 'text/plain;charset=utf-8');
   return filename;
 }
 
-/** 工序台账 CSV（全部胎体 + 道次 + 荫房） */
-export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): string {
-  const header = ['胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家', '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检', '荫房日期', '温度(℃)', '湿度(%)', '判定'];
+/**
+ * 工序台账 CSV（全部胎体 + 道次 + 荫干窗口）
+ * 按「胎体 + 日期」把记录仪读数与管理员时刻并排输出：
+ * 读数温湿度来自记录仪，入房出房时刻来自管理员，两侧缺一侧照样列出并标明对账状态。
+ */
+export function exportLedgerCsv(
+  bodies: Body[],
+  coats: Coat[],
+  readings: RoomReading[],
+  stays: RoomStay[],
+): string {
+  const header = [
+    '胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家',
+    '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检',
+    '荫房日期', '温度(℃)', '湿度(%)', '判定', '入房', '出房', '数据来源', '对账状态',
+  ];
   const lines: string[] = [header.map(csvCell).join(',')];
+
   bodies.forEach((body) => {
     const bodyCoats = coats.filter((item) => item.bodyId === body.id).sort((a, b) => a.seq - b.seq);
-    const bodyRooms = rooms.filter((item) => item.bodyId === body.id);
-    const rowCount = Math.max(bodyCoats.length, bodyRooms.length, 1);
+    const bodyReadings = readings.filter((item) => item.bodyId === body.id);
+    const bodyStays = stays.filter((item) => item.bodyId === body.id);
+
+    // 该胎体全部荫房日期 = 读数日期 ∪ 时刻日期，倒序
+    const dates = [...new Set([...bodyReadings.map((item) => item.date), ...bodyStays.map((item) => item.date)])].sort(
+      (a, b) => b.localeCompare(a),
+    );
+
+    // 荫房窗口行（读数与时刻按日期对齐）
+    const roomRows = dates.map((date) => {
+      const reading = bodyReadings.find((item) => item.date === date);
+      const stay = bodyStays.find((item) => item.date === date);
+      const matched = reading && stay;
+      const sources = [reading ? ROOM_SOURCE_LABEL[reading.source] : '', stay ? ROOM_SOURCE_LABEL[stay.source] : '']
+        .filter((text) => text.length > 0)
+        .join('/');
+      return [
+        date,
+        reading ? reading.tempC : '',
+        reading ? reading.humidityPct : '',
+        reading ? ROOM_VERDICT_LABEL[reading.verdict] : '',
+        stay ? stay.inAt : '',
+        stay ? stay.outAt : '',
+        sources,
+        matched ? '已认下' : `待确认（${reading ? '缺出入房时刻' : '缺记录仪读数'}）`,
+      ];
+    });
+
+    const rowCount = Math.max(bodyCoats.length, roomRows.length, 1);
     for (let index = 0; index < rowCount; index += 1) {
       const coat = bodyCoats[index];
-      const room = bodyRooms[index];
+      const room = roomRows[index];
       lines.push(
         [
           index === 0 ? body.code : '',
@@ -121,10 +163,14 @@ export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): s
           coat ? coat.thicknessUm : '',
           coat ? COAT_STATE_LABEL[coat.state] : '',
           coat ? (coat.needRecheck ? '是' : '否') : '',
-          room ? room.date : '',
-          room ? room.tempC : '',
-          room ? room.humidityPct : '',
-          room ? ROOM_VERDICT_LABEL[room.verdict] : '',
+          room ? room[0] : '',
+          room ? room[1] : '',
+          room ? room[2] : '',
+          room ? room[3] : '',
+          room ? room[4] : '',
+          room ? room[5] : '',
+          room ? room[6] : '',
+          room ? room[7] : '',
         ]
           .map(csvCell)
           .join(','),
@@ -132,7 +178,7 @@ export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): s
     }
   });
   const filename = `漆器髹涂台账-${stampSuffix()}.csv`;
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8');
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8');
   return filename;
 }
 

@@ -1,11 +1,14 @@
 /**
  * useCoatProgress()：按胎体统计道次完成度、当前道次、荫干等待时长与复检标记
+ * 荫房维度消费对账后的窗口：已认下（读数 + 出入房时刻两侧齐全）才计入窗口数，
+ * 待确认时段单列，越界次数只统计认下窗口（与道次回写口径一致）。
  * 被道次页（/coats）、荫房页（/rooms）、打磨页（/polish）与胎体页（/bodies）消费。
  */
 import { useCallback, useMemo } from 'react';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
 import { useRoomStore } from '@/stores/roomStore';
+import { reconcileWindowsOfBody } from '@/utils/reconcile';
 import { dryingHours, roomStayHours } from '@/utils/humidity';
 import { ROOM_VERDICT_LABEL } from '@/types/room';
 import { COAT_STATE_LABEL } from '@/types/coat';
@@ -30,7 +33,7 @@ export interface CoatProgressResult {
   map: Record<string, BodyStat>;
   /** 与胎体列表同序的统计数组 */
   list: BodyStat[];
-  /** 汇总：道次总数 / 已完成 / 待复检 */
+  /** 汇总：道次总数 / 已完成 / 待复检 / 认下窗口越界 */
   totals: { coatTotal: number; coatDone: number; percent: number; recheck: number; roomOver: number };
   /** 取单个胎体的统计（不存在时返回空统计） */
   progressOf: (bodyId: string) => BodyStat;
@@ -41,7 +44,8 @@ export interface CoatProgressResult {
 export function useCoatProgress(): CoatProgressResult {
   const bodies = useBodyStore((state) => state.bodies);
   const coats = useCoatStore((state) => state.coats);
-  const rooms = useRoomStore((state) => state.rooms);
+  const readings = useRoomStore((state) => state.readings);
+  const stays = useRoomStore((state) => state.stays);
 
   const map = useMemo<Record<string, BodyStat>>(() => {
     const result: Record<string, BodyStat> = {};
@@ -49,16 +53,16 @@ export function useCoatProgress(): CoatProgressResult {
       const bodyCoats = coats
         .filter((coat) => coat.bodyId === body.id)
         .sort((a, b) => a.seq - b.seq);
-      const bodyRooms = rooms
-        .filter((room) => room.bodyId === body.id)
-        .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+      // 对账窗口已按日期倒序：第 0 条为最新
+      const windows = reconcileWindowsOfBody(readings, stays, body.id);
+      const matched = windows.filter((window) => window.status === 'matched');
+      const lastWindow = windows.find((window) => window.status === 'matched') ?? windows[0];
       const done = bodyCoats.filter((coat) => coat.state === 'done').length;
       const current = bodyCoats.find((coat) => coat.state !== 'done');
-      const lastRoom = bodyRooms[bodyRooms.length - 1];
-      const overCount = bodyRooms.filter((room) => room.verdict !== 'suitable').length;
-      const waitHours = lastRoom
-        ? roomStayHours(lastRoom.inAt, lastRoom.outAt)
-        : lastRoom === undefined && bodyCoats[0]
+      const overCount = windows.filter((window) => window.breached).length;
+      const waitHours = lastWindow?.stay
+        ? roomStayHours(lastWindow.stay.inAt, lastWindow.stay.outAt)
+        : lastWindow === undefined && bodyCoats[0]
           ? dryingHours(24, 75, bodyCoats[0].thicknessUm)
           : 0;
       result[body.id] = {
@@ -67,10 +71,13 @@ export function useCoatProgress(): CoatProgressResult {
         coatDone: done,
         coatPercent: bodyCoats.length === 0 ? 0 : Math.round((done / bodyCoats.length) * 100),
         currentSeq: current ? current.seq : 0,
-        roomCount: bodyRooms.length,
+        // 荫干窗口只认两侧齐了对账认下的
+        roomCount: matched.length,
         roomOverCount: overCount,
-        lastRoomVerdict: lastRoom
-          ? `${lastRoom.date}　${lastRoom.tempC}℃ / ${lastRoom.humidityPct}%（${ROOM_VERDICT_LABEL[lastRoom.verdict]}）`
+        lastRoomVerdict: lastWindow
+          ? lastWindow.status === 'pending'
+            ? `${lastWindow.date} 待确认（${lastWindow.missing === 'stay' ? '缺出入房时刻' : '缺记录仪读数'}）`
+            : `${lastWindow.date}　${lastWindow.readings[0]?.tempC}℃ / ${lastWindow.readings[0]?.humidityPct}%（${ROOM_VERDICT_LABEL[lastWindow.verdict as 'suitable' | 'dry' | 'wet']}）`
           : '暂无记录',
         polishCount: 0,
         inlayCount: 0,
@@ -78,7 +85,7 @@ export function useCoatProgress(): CoatProgressResult {
       };
     });
     return result;
-  }, [bodies, coats, rooms]);
+  }, [bodies, coats, readings, stays]);
 
   const list = useMemo(() => bodies.map((body) => map[body.id] ?? { ...EMPTY_STAT, bodyId: body.id }), [bodies, map]);
 

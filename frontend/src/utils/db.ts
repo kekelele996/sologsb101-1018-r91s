@@ -1,14 +1,17 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Coat 增加 paintType 索引并回填历史记录）
- * - 六张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑：
+ *   v1 → v2：Coat 增加 paintType 索引并回填历史记录
+ *   v2 → v3：荫房记录按责任拆分为 room_readings（记录仪读数）与 room_stays（管理员出入房时刻），
+ *            旧 rooms 记录一条拆成两条并补出来源 legacy
+ * - 七张业务表的增删改查与整库导入导出
  * - 首次打开自动播种互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
 import Dexie, { type Table } from 'dexie';
 import type { Body } from '@/types/body';
 import type { Coat, PaintType } from '@/types/coat';
-import type { Room } from '@/types/room';
+import type { RoomReading, RoomStay } from '@/types/room';
 import type { Polish } from '@/types/polish';
 import type { Inlay } from '@/types/inlay';
 import type { Inspect } from '@/types/inspect';
@@ -17,7 +20,7 @@ import type { Inspect } from '@/types/inspect';
 export const DB_NAME = 'gblacquer';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -77,10 +80,58 @@ export function writeLastBackupAt(value: string): void {
   }
 }
 
+/** v2 及更早的荫房合并记录，仅升级迁移时使用 */
+interface LegacyRoom {
+  id: string;
+  bodyId: string;
+  date: string;
+  tempC: number;
+  humidityPct: number;
+  inAt: string;
+  outAt: string;
+  verdict: RoomReading['verdict'];
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+/** 旧合并记录一条拆两条：读数 + 时刻，两侧均补来源 legacy（升级与旧备份导入共用） */
+function splitLegacyRoom(
+  room: LegacyRoom,
+): { reading: RoomReading; stay: RoomStay } {
+  const createdAt = room.createdAt ?? Date.now();
+  const updatedAt = room.updatedAt ?? createdAt;
+  return {
+    reading: {
+      id: `reading_${room.id}`,
+      bodyId: room.bodyId,
+      date: room.date,
+      tempC: room.tempC,
+      humidityPct: room.humidityPct,
+      verdict: room.verdict,
+      source: 'legacy',
+      officer: '',
+      createdAt,
+      updatedAt,
+    },
+    stay: {
+      id: `stay_${room.id}`,
+      bodyId: room.bodyId,
+      date: room.date,
+      inAt: room.inAt,
+      outAt: room.outAt,
+      source: 'legacy',
+      manager: '',
+      createdAt,
+      updatedAt,
+    },
+  };
+}
+
 class LacquerDatabase extends Dexie {
   bodies!: Table<Body, string>;
   coats!: Table<Coat, string>;
-  rooms!: Table<Room, string>;
+  roomReadings!: Table<RoomReading, string>;
+  roomStays!: Table<RoomStay, string>;
   polishes!: Table<Polish, string>;
   inlays!: Table<Inlay, string>;
   inspects!: Table<Inspect, string>;
@@ -99,14 +150,29 @@ class LacquerDatabase extends Dexie {
     });
 
     // v2：Coat 增加 paintType 索引；历史记录缺少 paintType 时按「生漆」回填
+    this.version(2).stores({
+      bodies: 'id, code, material, shape, state, updatedAt',
+      coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
+      rooms: 'id, bodyId, date, verdict, updatedAt',
+      polishes: 'id, bodyId, seq, method, updatedAt',
+      inlays: 'id, bodyId, type, position, updatedAt',
+      inspects: 'id, bodyId, verdict, date, updatedAt',
+    });
+
+    // v3：荫房记录拆分为「记录仪读数」与「管理员出入房时刻」两张表；
+    // 旧 rooms 表必须用 rooms: null 显式标记删除（仅从 stores 省略会因 v1/v2 并集被保留）。
+    // 升级回调里仍可通过 tx.table('rooms') 读旧表数据：一条拆两条写入新表，两侧均补来源 legacy。
     this.version(DB_SCHEMA_VERSION)
       .stores({
         bodies: 'id, code, material, shape, state, updatedAt',
         coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
-        rooms: 'id, bodyId, date, verdict, updatedAt',
+        // 复合索引 [bodyId+date] 供按胎体编号加日期对账
+        roomReadings: 'id, bodyId, date, verdict, source, [bodyId+date], updatedAt',
+        roomStays: 'id, bodyId, date, source, [bodyId+date], updatedAt',
         polishes: 'id, bodyId, seq, method, updatedAt',
         inlays: 'id, bodyId, type, position, updatedAt',
         inspects: 'id, bodyId, verdict, date, updatedAt',
+        rooms: null,
       })
       .upgrade(async (tx) => {
         await tx
@@ -118,14 +184,39 @@ class LacquerDatabase extends Dexie {
             if (typeof coat.needRecheck !== 'boolean') coat.needRecheck = false;
             if (typeof coat.thicknessUm !== 'number') coat.thicknessUm = 40;
           });
+
+        const legacyRooms = await tx.table<LegacyRoom>('rooms').toArray();
+        if (legacyRooms.length > 0) {
+          const split = legacyRooms.map(splitLegacyRoom);
+          await tx.table<RoomReading>('roomReadings').bulkPut(split.map((item) => item.reading));
+          await tx.table<RoomStay>('roomStays').bulkPut(split.map((item) => item.stay));
+          // 质检单引用的旧 room id 改指向拆分后的读数 id（reading_ 前缀）
+          const legacyRoomIds = new Set(legacyRooms.map((room) => room.id));
+          await tx
+            .table<Inspect>('inspects')
+            .toCollection()
+            .modify((inspect) => {
+              if (inspect.defectRoomId && legacyRoomIds.has(inspect.defectRoomId)) {
+                inspect.defectRoomId = `reading_${inspect.defectRoomId}`;
+              }
+            });
+        }
       });
   }
 }
 
 export const db = new LacquerDatabase();
 
-/** 六张业务表清单，事务中统一引用 */
-const TABLE_LIST = [db.bodies, db.coats, db.rooms, db.polishes, db.inlays, db.inspects];
+/** 七张业务表清单，事务中统一引用 */
+const TABLE_LIST = [
+  db.bodies,
+  db.coats,
+  db.roomReadings,
+  db.roomStays,
+  db.polishes,
+  db.inlays,
+  db.inspects,
+];
 
 /** 生成主键：短前缀 + 时间戳 + 随机串，避免多标签页写入冲突 */
 export function createId(prefix: string): string {
@@ -143,7 +234,7 @@ export async function initDatabase(): Promise<void> {
 }
 
 /* ------------------------------ 播种数据 ------------------------------ */
-/* 三层互相引用：Body →（Coat / Room / Polish / Inlay）→ Inspect，id 固定便于深链命中 */
+/* 三层互相引用：Body →（Coat / RoomReading / RoomStay / Polish / Inlay）→ Inspect，id 固定便于深链命中 */
 
 export async function seedDatabase(): Promise<void> {
   const now = Date.now();
@@ -194,11 +285,24 @@ export async function seedDatabase(): Promise<void> {
     { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
   ];
 
-  const rooms: Room[] = [
-    { id: 'room_0101', bodyId: 'body_01', date: '2026-03-03', tempC: 24, humidityPct: 78, inAt: '09:00', outAt: '21:00', verdict: 'suitable', createdAt: now - 86400000 * 10, updatedAt: now - 86400000 * 10 },
-    { id: 'room_0102', bodyId: 'body_01', date: '2026-03-07', tempC: 27, humidityPct: 56, inAt: '08:30', outAt: '20:00', verdict: 'dry', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 2 },
-    { id: 'room_0201', bodyId: 'body_02', date: '2026-03-05', tempC: 23, humidityPct: 91, inAt: '10:00', outAt: '22:30', verdict: 'wet', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
-    { id: 'room_0301', bodyId: 'body_03', date: '2026-02-20', tempC: 25, humidityPct: 76, inAt: '09:30', outAt: '21:30', verdict: 'suitable', createdAt: now - 86400000 * 18, updatedAt: now - 86400000 * 18 },
+  // 记录仪读数：温湿度认记录仪（值班员赵勤）；room_0102 为偏干越界样本
+  const roomReadings: RoomReading[] = [
+    { id: 'reading_0101', bodyId: 'body_01', date: '2026-03-03', tempC: 24, humidityPct: 78, verdict: 'suitable', source: 'logger', officer: '赵勤', createdAt: now - 86400000 * 10, updatedAt: now - 86400000 * 10 },
+    { id: 'reading_0102', bodyId: 'body_01', date: '2026-03-07', tempC: 27, humidityPct: 56, verdict: 'dry', source: 'logger', officer: '赵勤', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 2 },
+    { id: 'reading_0201', bodyId: 'body_02', date: '2026-03-05', tempC: 23, humidityPct: 91, verdict: 'wet', source: 'logger', officer: '赵勤', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
+    { id: 'reading_0301', bodyId: 'body_03', date: '2026-02-20', tempC: 25, humidityPct: 76, verdict: 'suitable', source: 'logger', officer: '赵勤', createdAt: now - 86400000 * 18, updatedAt: now - 86400000 * 18 },
+    // 只有读数、管理员尚未补出入房时刻：对账挂「待确认」
+    { id: 'reading_0103', bodyId: 'body_01', date: '2026-03-09', tempC: 25, humidityPct: 80, verdict: 'suitable', source: 'logger', officer: '赵勤', createdAt: now - 86400000 * 3, updatedAt: now - 86400000 * 3 },
+  ];
+
+  // 管理员出入房时刻：入房出房时刻认管理员（管理员孙茂）
+  const roomStays: RoomStay[] = [
+    { id: 'stay_0101', bodyId: 'body_01', date: '2026-03-03', inAt: '09:00', outAt: '21:00', source: 'manager', manager: '孙茂', createdAt: now - 86400000 * 10, updatedAt: now - 86400000 * 10 },
+    { id: 'stay_0102', bodyId: 'body_01', date: '2026-03-07', inAt: '08:30', outAt: '20:00', source: 'manager', manager: '孙茂', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 2 },
+    { id: 'stay_0201', bodyId: 'body_02', date: '2026-03-05', inAt: '10:00', outAt: '22:30', source: 'manager', manager: '孙茂', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
+    { id: 'stay_0301', bodyId: 'body_03', date: '2026-02-20', inAt: '09:30', outAt: '21:30', source: 'manager', manager: '孙茂', createdAt: now - 86400000 * 18, updatedAt: now - 86400000 * 18 },
+    // 只有时刻、记录仪读数未导入：对账挂「待确认」
+    { id: 'stay_0202', bodyId: 'body_02', date: '2026-03-09', inAt: '09:15', outAt: '21:10', source: 'manager', manager: '孙茂', createdAt: now - 86400000 * 3, updatedAt: now - 86400000 * 3 },
   ];
 
   const polishes: Polish[] = [
@@ -217,13 +321,14 @@ export async function seedDatabase(): Promise<void> {
 
   const inspects: Inspect[] = [
     { id: 'inspect_0101', bodyId: 'body_03', verdict: 'pass', defectNote: '', inspector: '周衡', date: '2026-03-02', defectCoatSeq: null, defectRoomId: null, createdAt: now - 86400000 * 4, updatedAt: now - 86400000 * 4 },
-    { id: 'inspect_0102', bodyId: 'body_02', verdict: 'rework', defectNote: '起皱（荫干过快）', inspector: '周衡', date: '2026-03-08', defectCoatSeq: 2, defectRoomId: 'room_0201', createdAt: now - 86400000, updatedAt: now - 86400000 },
+    { id: 'inspect_0102', bodyId: 'body_02', verdict: 'rework', defectNote: '起皱（荫干过快）', inspector: '周衡', date: '2026-03-08', defectCoatSeq: 2, defectRoomId: 'reading_0201', createdAt: now - 86400000, updatedAt: now - 86400000 },
   ];
 
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.bodies.bulkPut(bodies);
     await db.coats.bulkPut(coats);
-    await db.rooms.bulkPut(rooms);
+    await db.roomReadings.bulkPut(roomReadings);
+    await db.roomStays.bulkPut(roomStays);
     await db.polishes.bulkPut(polishes);
     await db.inlays.bulkPut(inlays);
     await db.inspects.bulkPut(inspects);
@@ -238,17 +343,23 @@ export interface LacquerSnapshot {
   exportedAt: string;
   bodies: Body[];
   coats: Coat[];
-  rooms: Room[];
+  /** v3：记录仪读数（旧备份导入时可能缺失，按空集合处理） */
+  roomReadings: RoomReading[];
+  /** v3：管理员出入房时刻（旧备份导入时可能缺失，按空集合处理） */
+  roomStays: RoomStay[];
   polishes: Polish[];
   inlays: Inlay[];
   inspects: Inspect[];
+  /** v2 及更早备份中的荫房合并记录，仅导入兼容使用 */
+  rooms?: LegacyRoom[];
 }
 
 export async function exportSnapshot(): Promise<LacquerSnapshot> {
-  const [bodies, coats, rooms, polishes, inlays, inspects] = await Promise.all([
+  const [bodies, coats, roomReadings, roomStays, polishes, inlays, inspects] = await Promise.all([
     db.bodies.toArray(),
     db.coats.toArray(),
-    db.rooms.toArray(),
+    db.roomReadings.toArray(),
+    db.roomStays.toArray(),
     db.polishes.toArray(),
     db.inlays.toArray(),
     db.inspects.toArray(),
@@ -259,34 +370,63 @@ export async function exportSnapshot(): Promise<LacquerSnapshot> {
     exportedAt: new Date().toISOString(),
     bodies,
     coats,
-    rooms,
+    roomReadings,
+    roomStays,
     polishes,
     inlays,
     inspects,
   };
 }
 
-/** 校验导入文件结构，返回错误文案（空串表示通过） */
+/**
+ * 校验导入文件结构，返回错误文案（空串表示通过）。
+ * 荫房两类记录在 v3 才出现，v2 旧备份允许缺失，导入时按旧 rooms 拆分升级。
+ */
 export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<LacquerSnapshot>;
   if (snapshot.app !== DB_NAME) return `备份文件不属于本项目（app=${String(snapshot.app)}）`;
-  const keys: Array<keyof LacquerSnapshot> = ['bodies', 'coats', 'rooms', 'polishes', 'inlays', 'inspects'];
+  const keys: Array<keyof LacquerSnapshot> = ['bodies', 'coats', 'polishes', 'inlays', 'inspects'];
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
+  }
+  const hasSplitRooms = Array.isArray(snapshot.roomReadings) && Array.isArray(snapshot.roomStays);
+  if (!hasSplitRooms && !Array.isArray(snapshot.rooms)) {
+    return '备份文件缺少 roomReadings / roomStays（或旧版 rooms）集合';
   }
   return '';
 }
 
+/** 把旧版合并荫房记录拆成读数 + 时刻，两侧补出来源 legacy */
+function splitLegacyRooms(rooms: LegacyRoom[]): { readings: RoomReading[]; stays: RoomStay[] } {
+  const split = rooms.map(splitLegacyRoom);
+  return {
+    readings: split.map((item) => item.reading),
+    stays: split.map((item) => item.stay),
+  };
+}
+
 export async function importSnapshot(snapshot: LacquerSnapshot): Promise<void> {
+  const roomReadings = Array.isArray(snapshot.roomReadings) ? snapshot.roomReadings : [];
+  const roomStays = Array.isArray(snapshot.roomStays) ? snapshot.roomStays : [];
+  // v2 及更早备份：导入时同样一条拆两条并补出来源；质检单的旧 room id 改指向读数 id
+  const legacy = Array.isArray(snapshot.rooms) ? splitLegacyRooms(snapshot.rooms) : { readings: [], stays: [] };
+  const legacyIdMap = new Map(legacy.readings.map((reading) => [reading.id.replace(/^reading_/, ''), reading.id]));
+  const inspects = snapshot.inspects.map((inspect) =>
+    inspect.defectRoomId && legacyIdMap.has(inspect.defectRoomId)
+      ? { ...inspect, defectRoomId: legacyIdMap.get(inspect.defectRoomId) as string }
+      : inspect,
+  );
+
   await clearAllTables();
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.bodies.bulkPut(snapshot.bodies);
     await db.coats.bulkPut(snapshot.coats);
-    await db.rooms.bulkPut(snapshot.rooms);
+    await db.roomReadings.bulkPut([...roomReadings, ...legacy.readings]);
+    await db.roomStays.bulkPut([...roomStays, ...legacy.stays]);
     await db.polishes.bulkPut(snapshot.polishes);
     await db.inlays.bulkPut(snapshot.inlays);
-    await db.inspects.bulkPut(snapshot.inspects);
+    await db.inspects.bulkPut(inspects);
   });
 }
 
@@ -295,7 +435,8 @@ export async function clearAllTables(): Promise<void> {
     await Promise.all([
       db.bodies.clear(),
       db.coats.clear(),
-      db.rooms.clear(),
+      db.roomReadings.clear(),
+      db.roomStays.clear(),
       db.polishes.clear(),
       db.inlays.clear(),
       db.inspects.clear(),
@@ -310,15 +451,16 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [bodies, coats, rooms, polishes, inlays, inspects] = await Promise.all([
+  const [bodies, coats, roomReadings, roomStays, polishes, inlays, inspects] = await Promise.all([
     db.bodies.count(),
     db.coats.count(),
-    db.rooms.count(),
+    db.roomReadings.count(),
+    db.roomStays.count(),
     db.polishes.count(),
     db.inlays.count(),
     db.inspects.count(),
   ]);
-  return { bodies, coats, rooms, polishes, inlays, inspects };
+  return { bodies, coats, roomReadings, roomStays, polishes, inlays, inspects };
 }
 
 /* ------------------------------ 级联删除 ------------------------------ */
@@ -326,7 +468,8 @@ export async function countAll(): Promise<Record<string, number>> {
 export async function removeBodyCascade(bodyId: string): Promise<void> {
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.coats.where('bodyId').equals(bodyId).delete();
-    await db.rooms.where('bodyId').equals(bodyId).delete();
+    await db.roomReadings.where('bodyId').equals(bodyId).delete();
+    await db.roomStays.where('bodyId').equals(bodyId).delete();
     await db.polishes.where('bodyId').equals(bodyId).delete();
     await db.inlays.where('bodyId').equals(bodyId).delete();
     await db.inspects.where('bodyId').equals(bodyId).delete();
