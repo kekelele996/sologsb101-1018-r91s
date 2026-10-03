@@ -17,7 +17,9 @@ import {
 import { ROUTES } from './router';
 import { useBodyStore } from './stores/bodyStore';
 import { useCoatStore } from './stores/coatStore';
-import { useRoomStore } from './stores/roomStore';
+import { useReadingStore } from './stores/readingStore';
+import { useStayStore } from './stores/stayStore';
+import { syncEnvToCoats } from './stores/roomSync';
 import { initDatabase } from './utils/db';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL, BODY_STATE_LABEL } from './types/body';
 
@@ -33,8 +35,10 @@ export default function App() {
   const loadBodies = useBodyStore((state) => state.loadBodies);
   const coats = useCoatStore((state) => state.coats);
   const loadCoats = useCoatStore((state) => state.loadCoats);
-  const rooms = useRoomStore((state) => state.rooms);
-  const loadRooms = useRoomStore((state) => state.loadRooms);
+  const readings = useReadingStore((state) => state.readings);
+  const loadReadings = useReadingStore((state) => state.loadReadings);
+  const stays = useStayStore((state) => state.stays);
+  const loadStays = useStayStore((state) => state.loadStays);
 
   useEffect(() => {
     let cancelled = false;
@@ -42,7 +46,15 @@ export default function App() {
       try {
         await initDatabase();
         if (cancelled) return;
-        await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+        await Promise.all([loadBodies(), loadCoats(), loadReadings(), loadStays()]);
+        if (cancelled) return;
+        // 启动后按当前读数/入出房重算一次：旧数据升级补登后保证道次状态与认下窗口一致
+        const sync = await syncEnvToCoats();
+        if (cancelled) return;
+        if (sync.recheckCoats > 0) {
+          message.warning(`荫干窗口越界：${sync.recheckCoats} 个未完道次挂待复检` +
+            (sync.polishRolledBack > 0 ? `，其中 ${sync.polishRolledBack} 个打磨退回` : ''));
+        }
       } catch (error) {
         if (cancelled) return;
         message.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -51,7 +63,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [loadBodies, loadCoats, loadRooms, message]);
+  }, [loadBodies, loadCoats, loadReadings, loadStays, message]);
 
   const currentBody = bodies.find((body) => body.id === currentBodyId) ?? null;
   const selectedKey = location.pathname.startsWith('/coats')
@@ -98,7 +110,7 @@ export default function App() {
               <DashboardOutlined /> 胎体 {bodies.length} 件
             </span>
             <span>髹涂道次 {coats.length} 道</span>
-            <span>荫房记录 {rooms.length} 条</span>
+            <span>记录仪读数 {readings.length} 条 · 入出房 {stays.length} 条</span>
           </Space>
         </div>
       </Sider>

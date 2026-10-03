@@ -145,7 +145,7 @@ export default function BodyList() {
         <StatBadge label="胎体总数" value={bodies.length} suffix="件" tone="primary" />
         <StatBadge label="道次完成率" value={`${totals.percent}%`} percent={totals.percent} tone="success" />
         <StatBadge label="待复检道次" value={totals.recheck} suffix="道" tone="warning" />
-        <StatBadge label="荫房超标" value={totals.roomOver} suffix="次" tone="danger" />
+        <StatBadge label="认下窗口越界" value={totals.roomOver} suffix="次" tone="danger" />
         <StatBadge label="镶嵌登记" value={inlayTotal} suffix="条" tone="info" />
       </div>
 
@@ -219,9 +219,9 @@ export default function BodyList() {
                         {stat.currentSeq > 0 ? ` · 当前第 ${stat.currentSeq} 道` : ' · 全部完成'}
                       </Typography.Text>
                       <Typography.Text type="secondary">当前工序：{currentCoatText(body.id)}</Typography.Text>
-                      <Typography.Text type="secondary">最近荫房：{stat.lastRoomVerdict}</Typography.Text>
+                      <Typography.Text type="secondary">最近认下窗口：{stat.lastRoomVerdict}</Typography.Text>
                       <Typography.Text type="secondary">
-                        荫干等待 {stat.dryingHours} 小时 · 荫房超标 {stat.roomOverCount} 次
+                        荫干等待 {stat.dryingHours} 小时 · 认下窗口越界 {stat.roomOverCount} 次
                       </Typography.Text>
                       <Space size={4} wrap onClick={(event) => event.stopPropagation()}>
                         <Tooltip title="按 待髹涂 → 髹涂中 → 待荫干 → 已完成 推进">

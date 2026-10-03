@@ -1,15 +1,19 @@
 /**
  * 导出工具：整库 JSON 存档、返工清单文本、编目清单 CSV
+ * 荫房部分以对账窗口（记录仪读数 × 管理员入出房）为口径；
  * 全部在浏览器本地完成，不经过任何服务端。
  */
 import type { Body } from '@/types/body';
 import type { Coat } from '@/types/coat';
-import type { Room } from '@/types/room';
+import type { Reading } from '@/types/reading';
+import type { Stay } from '@/types/stay';
 import type { Inspect } from '@/types/inspect';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL } from '@/types/body';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
-import { ROOM_VERDICT_LABEL } from '@/types/room';
+import { ENV_VERDICT_LABEL, READING_SOURCE_LABEL } from '@/types/reading';
+import { STAY_SOURCE_LABEL } from '@/types/stay';
 import { INSPECT_VERDICT_LABEL } from '@/types/inspect';
+import { reconcile, type ReconcileWindow } from './reconciliation';
 import type { LacquerSnapshot } from './db';
 
 /** 触发浏览器下载 */
@@ -45,11 +49,16 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 返工清单：定位到具体道次与荫房记录 */
+/** 代表性读数（与窗口综合判定一致的最不利一条） */
+function representativeReading(window: ReconcileWindow): Reading | null {
+  return window.windowReadings.find((row) => row.id === window.verdictReadingId) ?? window.windowReadings[0] ?? null;
+}
+
+/** 返工清单：定位到具体道次与记录仪读数 */
 export function buildReworkList(
   bodies: Body[],
   coats: Coat[],
-  rooms: Room[],
+  readings: Reading[],
   inspects: Inspect[],
 ): string {
   const lines: string[] = ['漆器髹涂返工清单', `生成时间：${new Date().toLocaleString('zh-CN')}`, ''];
@@ -61,7 +70,8 @@ export function buildReworkList(
   reworks.forEach((inspect, index) => {
     const body = bodies.find((item) => item.id === inspect.bodyId);
     const coat = coats.find((item) => item.bodyId === inspect.bodyId && item.seq === inspect.defectCoatSeq);
-    const room = rooms.find((item) => item.id === inspect.defectRoomId);
+    // defectRoomId 沿用旧字段名，v3 起存记录仪读数 id（旧记录升级后 id 不变，仍可命中）
+    const reading = readings.find((item) => item.id === inspect.defectRoomId);
     lines.push(`${index + 1}. ${body ? `${body.code}（${BODY_MATERIAL_LABEL[body.material]}·${BODY_SHAPE_LABEL[body.shape]}）` : inspect.bodyId}`);
     lines.push(`   质检日期：${inspect.date}　质检人：${inspect.inspector || '未填写'}　结论：${INSPECT_VERDICT_LABEL[inspect.verdict]}`);
     lines.push(`   缺陷：${inspect.defectNote || '未填写'}`);
@@ -73,9 +83,9 @@ export function buildReworkList(
       }`,
     );
     lines.push(
-      `   关联荫房：${
-        room
-          ? `${room.date}　${room.tempC}℃ / ${room.humidityPct}%（${ROOM_VERDICT_LABEL[room.verdict]}）`
+      `   关联记录仪读数：${
+        reading
+          ? `${reading.date} ${reading.sampledAt || '时刻缺'}　${reading.tempC}℃ / ${reading.humidityPct}%（${ENV_VERDICT_LABEL[reading.verdict]} · ${READING_SOURCE_LABEL[reading.source]}）`
           : '未指定'
       }`,
     );
@@ -88,25 +98,45 @@ export function buildReworkList(
 export function exportReworkList(
   bodies: Body[],
   coats: Coat[],
-  rooms: Room[],
+  readings: Reading[],
   inspects: Inspect[],
 ): string {
   const filename = `漆器返工清单-${stampSuffix()}.txt`;
-  download(filename, buildReworkList(bodies, coats, rooms, inspects), 'text/plain;charset=utf-8');
+  download(filename, buildReworkList(bodies, coats, readings, inspects), 'text/plain;charset=utf-8');
   return filename;
 }
 
-/** 工序台账 CSV（全部胎体 + 道次 + 荫房） */
-export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): string {
-  const header = ['胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家', '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检', '荫房日期', '温度(℃)', '湿度(%)', '判定'];
+/** 工序台账 CSV（全部胎体 + 道次 + 认下荫干窗口） */
+export function exportLedgerCsv(bodies: Body[], coats: Coat[], readings: Reading[], stays: Stay[]): string {
+  const header = [
+    '胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家',
+    '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检',
+    '荫干日期', '入房', '出房', '在房小时', '温度(℃)', '湿度(%)', '窗口判定', '对账状态', '读数来源', '入出房来源',
+  ];
   const lines: string[] = [header.map(csvCell).join(',')];
+  const windows = reconcile(readings, stays);
+  const windowKey = (bodyId: string, date: string): string => `${bodyId}__${date}`;
+  const windowMap = new Map(windows.map((window) => [windowKey(window.bodyId, window.date), window]));
+
   bodies.forEach((body) => {
     const bodyCoats = coats.filter((item) => item.bodyId === body.id).sort((a, b) => a.seq - b.seq);
-    const bodyRooms = rooms.filter((item) => item.bodyId === body.id);
-    const rowCount = Math.max(bodyCoats.length, bodyRooms.length, 1);
+    const bodyStays = stays
+      .filter((item) => item.bodyId === body.id)
+      .sort((a, b) => a.date.localeCompare(b.date));
+    const bodyDates = new Set<string>([
+      ...bodyStays.map((stay) => stay.date),
+      ...readings.filter((row) => row.bodyId === body.id).map((row) => row.date),
+    ]);
+    const bodyWindows = [...bodyDates]
+      .sort((a, b) => b.localeCompare(a))
+      .map((date) => windowMap.get(windowKey(body.id, date)))
+      .filter((window): window is ReconcileWindow => window !== undefined);
+
+    const rowCount = Math.max(bodyCoats.length, bodyWindows.length, 1);
     for (let index = 0; index < rowCount; index += 1) {
       const coat = bodyCoats[index];
-      const room = bodyRooms[index];
+      const window = bodyWindows[index];
+      const sample = window ? representativeReading(window) : null;
       lines.push(
         [
           index === 0 ? body.code : '',
@@ -121,10 +151,16 @@ export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): s
           coat ? coat.thicknessUm : '',
           coat ? COAT_STATE_LABEL[coat.state] : '',
           coat ? (coat.needRecheck ? '是' : '否') : '',
-          room ? room.date : '',
-          room ? room.tempC : '',
-          room ? room.humidityPct : '',
-          room ? ROOM_VERDICT_LABEL[room.verdict] : '',
+          window ? window.date : '',
+          window?.stay ? window.stay.inAt : '',
+          window?.stay ? window.stay.outAt : '',
+          window && window.stay ? window.stayHours : '',
+          sample ? sample.tempC : '',
+          sample ? sample.humidityPct : '',
+          window && window.acknowledged && window.verdict ? ENV_VERDICT_LABEL[window.verdict] : window ? '待确认' : '',
+          window ? (window.acknowledged ? '已认下' : '待确认') : '',
+          sample ? READING_SOURCE_LABEL[sample.source] : '',
+          window?.stay ? STAY_SOURCE_LABEL[window.stay.source] : '',
         ]
           .map(csvCell)
           .join(','),
@@ -132,7 +168,7 @@ export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): s
     }
   });
   const filename = `漆器髹涂台账-${stampSuffix()}.csv`;
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8');
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8');
   return filename;
 }
 

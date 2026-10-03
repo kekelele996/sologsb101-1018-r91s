@@ -4,7 +4,7 @@
  * - 露点估算（Magnus 公式）
  * - 荫干时长建议与漆种间隔建议
  */
-import type { RoomVerdict } from '@/types/room';
+import type { EnvVerdict } from '@/types/reading';
 import type { PaintType } from '@/types/coat';
 import type { BodyShape } from '@/types/body';
 
@@ -13,7 +13,7 @@ export const HUMIDITY_RANGE = { min: 65, max: 85 } as const;
 export const TEMP_RANGE = { min: 20, max: 28 } as const;
 
 /** 判定：湿度低于下限为偏干，高于上限为偏湿，温度越界同样按干湿提示 */
-export function judgeVerdict(tempC: number, humidityPct: number): RoomVerdict {
+export function judgeVerdict(tempC: number, humidityPct: number): EnvVerdict {
   if (humidityPct < HUMIDITY_RANGE.min) return 'dry';
   if (humidityPct > HUMIDITY_RANGE.max) return 'wet';
   if (tempC < TEMP_RANGE.min) return 'dry';

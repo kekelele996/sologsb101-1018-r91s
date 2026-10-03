@@ -1,13 +1,17 @@
 /**
  * useCoatProgress()：按胎体统计道次完成度、当前道次、荫干等待时长与复检标记
  * 被道次页（/coats）、荫房页（/rooms）、打磨页（/polish）与胎体页（/bodies）消费。
+ * 荫房口径：记录仪读数与管理员入出房按「胎体 + 日期」对账后，只统计认下的荫干窗口；
+ * 待确认的漏边时段不计入超标，也不回写道次。
  */
 import { useCallback, useMemo } from 'react';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
-import { useRoomStore } from '@/stores/roomStore';
-import { dryingHours, roomStayHours } from '@/utils/humidity';
-import { ROOM_VERDICT_LABEL } from '@/types/room';
+import { useReadingStore } from '@/stores/readingStore';
+import { useStayStore } from '@/stores/stayStore';
+import { dryingHours } from '@/utils/humidity';
+import { reconcile, type ReconcileWindow } from '@/utils/reconciliation';
+import { ENV_VERDICT_LABEL } from '@/types/reading';
 import { COAT_STATE_LABEL } from '@/types/coat';
 import type { BodyStat } from '@/types/body';
 
@@ -25,6 +29,15 @@ const EMPTY_STAT: BodyStat = {
   dryingHours: 0,
 };
 
+/** 窗口综合读数文案：取最不利一条（越界优先），温湿度来自该条采样 */
+function windowClimateText(window: ReconcileWindow): string {
+  if (window.windowReadings.length === 0) return `已认下（无读数，${ENV_VERDICT_LABEL.suitable}）`;
+  const representative =
+    window.windowReadings.find((row) => row.id === window.verdictReadingId) ?? window.windowReadings[0];
+  if (!representative) return ENV_VERDICT_LABEL.suitable;
+  return `${representative.tempC}℃ / ${representative.humidityPct}%（${ENV_VERDICT_LABEL[representative.verdict]}）`;
+}
+
 export interface CoatProgressResult {
   /** 胎体 id → 统计 */
   map: Record<string, BodyStat>;
@@ -41,7 +54,18 @@ export interface CoatProgressResult {
 export function useCoatProgress(): CoatProgressResult {
   const bodies = useBodyStore((state) => state.bodies);
   const coats = useCoatStore((state) => state.coats);
-  const rooms = useRoomStore((state) => state.rooms);
+  const readings = useReadingStore((state) => state.readings);
+  const stays = useStayStore((state) => state.stays);
+
+  const windowsByBody = useMemo(() => {
+    const map = new Map<string, ReconcileWindow[]>();
+    reconcile(readings, stays).forEach((window) => {
+      const list = map.get(window.bodyId) ?? [];
+      list.push(window);
+      map.set(window.bodyId, list);
+    });
+    return map;
+  }, [readings, stays]);
 
   const map = useMemo<Record<string, BodyStat>>(() => {
     const result: Record<string, BodyStat> = {};
@@ -49,16 +73,17 @@ export function useCoatProgress(): CoatProgressResult {
       const bodyCoats = coats
         .filter((coat) => coat.bodyId === body.id)
         .sort((a, b) => a.seq - b.seq);
-      const bodyRooms = rooms
-        .filter((room) => room.bodyId === body.id)
-        .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+      const bodyWindows = windowsByBody.get(body.id) ?? []; // reconcile 已按日期倒序
+      const acknowledged = bodyWindows.filter((window) => window.acknowledged);
       const done = bodyCoats.filter((coat) => coat.state === 'done').length;
       const current = bodyCoats.find((coat) => coat.state !== 'done');
-      const lastRoom = bodyRooms[bodyRooms.length - 1];
-      const overCount = bodyRooms.filter((room) => room.verdict !== 'suitable').length;
-      const waitHours = lastRoom
-        ? roomStayHours(lastRoom.inAt, lastRoom.outAt)
-        : lastRoom === undefined && bodyCoats[0]
+      const lastWindow = acknowledged[0];
+      const overCount = acknowledged.filter((window) => window.over).length;
+      const waitHours = lastWindow
+        ? lastWindow.stayHours > 0
+          ? lastWindow.stayHours
+          : dryingHours(24, 75, bodyCoats[0]?.thicknessUm ?? 40)
+        : bodyCoats[0]
           ? dryingHours(24, 75, bodyCoats[0].thicknessUm)
           : 0;
       result[body.id] = {
@@ -67,18 +92,16 @@ export function useCoatProgress(): CoatProgressResult {
         coatDone: done,
         coatPercent: bodyCoats.length === 0 ? 0 : Math.round((done / bodyCoats.length) * 100),
         currentSeq: current ? current.seq : 0,
-        roomCount: bodyRooms.length,
+        roomCount: acknowledged.length,
         roomOverCount: overCount,
-        lastRoomVerdict: lastRoom
-          ? `${lastRoom.date}　${lastRoom.tempC}℃ / ${lastRoom.humidityPct}%（${ROOM_VERDICT_LABEL[lastRoom.verdict]}）`
-          : '暂无记录',
+        lastRoomVerdict: lastWindow ? `${lastWindow.date}　${windowClimateText(lastWindow)}` : '暂无认下窗口',
         polishCount: 0,
         inlayCount: 0,
         dryingHours: waitHours,
       };
     });
     return result;
-  }, [bodies, coats, rooms]);
+  }, [bodies, coats, windowsByBody]);
 
   const list = useMemo(() => bodies.map((body) => map[body.id] ?? { ...EMPTY_STAT, bodyId: body.id }), [bodies, map]);
 

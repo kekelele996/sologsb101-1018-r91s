@@ -108,11 +108,11 @@ export interface BodyStat {
   coatPercent: number;
   /** 当前道次序号（无则 0） */
   currentSeq: number;
-  /** 荫房记录条数 */
+  /** 已认下的荫干窗口条数（两边齐或单边核实） */
   roomCount: number;
-  /** 荫房超标次数 */
+  /** 认下窗口内越界次数（待确认时段不计） */
   roomOverCount: number;
-  /** 最近一次荫房判定文案 */
+  /** 最近一次认下窗口判定文案 */
   lastRoomVerdict: string;
   /** 打磨道次条数 */
   polishCount: number;

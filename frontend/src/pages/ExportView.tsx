@@ -36,10 +36,11 @@ import StatBadge from '@/components/common/StatBadge';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
-import { useRoomStore } from '@/stores/roomStore';
+import { useReadingStore } from '@/stores/readingStore';
+import { useStayStore } from '@/stores/stayStore';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
-import { ROOM_VERDICT_LABEL } from '@/types/room';
+import { ENV_VERDICT_LABEL } from '@/types/reading';
 import {
   INSPECT_VERDICT_COLOR,
   INSPECT_VERDICT_LABEL,
@@ -54,11 +55,11 @@ import {
   DB_SCHEMA_VERSION,
   exportSnapshot,
   importSnapshot,
+  normalizeSnapshot,
   readLastBackupAt,
   resetDatabase,
   validateSnapshot,
   writeLastBackupAt,
-  type LacquerSnapshot,
 } from '@/utils/db';
 import { buildReworkList, copyText, exportLedgerCsv, exportReworkList, exportSnapshotJson } from '@/utils/export';
 
@@ -72,8 +73,10 @@ export default function ExportView() {
   const loadBodies = useBodyStore((state) => state.loadBodies);
   const coats = useCoatStore((state) => state.coats);
   const loadCoats = useCoatStore((state) => state.loadCoats);
-  const rooms = useRoomStore((state) => state.rooms);
-  const loadRooms = useRoomStore((state) => state.loadRooms);
+  const readings = useReadingStore((state) => state.readings);
+  const loadReadings = useReadingStore((state) => state.loadReadings);
+  const stays = useStayStore((state) => state.stays);
+  const loadStays = useStayStore((state) => state.loadStays);
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Inspect | null>(null);
@@ -92,11 +95,11 @@ export default function ExportView() {
 
   const draftBodyId = watchedBodyId ?? bodies[0]?.id ?? '';
   const draftCoats = coats.filter((coat) => coat.bodyId === draftBodyId).sort((a, b) => a.seq - b.seq);
-  const draftRooms = rooms.filter((room) => room.bodyId === draftBodyId);
+  const draftReadings = readings.filter((reading) => reading.bodyId === draftBodyId);
 
   const reworkText = useMemo(
-    () => buildReworkList(bodies, coats, rooms, inspectTable.rows),
-    [bodies, coats, rooms, inspectTable.rows],
+    () => buildReworkList(bodies, coats, readings, inspectTable.rows),
+    [bodies, coats, readings, inspectTable.rows],
   );
 
   const openCreate = (): void => {
@@ -171,20 +174,21 @@ export default function ExportView() {
     }
     modal.confirm({
       title: '覆盖导入本地数据',
-      content: '导入会清空当前浏览器中的全部档案，再写入备份内容，操作不可撤销。',
+      content: '导入会清空当前浏览器中的全部档案，再写入备份内容，操作不可撤销。旧版备份（v2 合并荫房记录）会自动拆成读数与入出房两边并补来源。',
       okText: '确认导入',
       cancelText: '取消',
       onOk: async () => {
-        await importSnapshot(parsed as LacquerSnapshot);
-        await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
-        message.success('导入完成，数据已覆盖');
+        const normalized = normalizeSnapshot(parsed);
+        await importSnapshot(normalized);
+        await Promise.all([loadBodies(), loadCoats(), loadReadings(), loadStays()]);
+        message.success('导入完成，数据已覆盖（旧荫房记录已分账补登来源）');
       },
     });
   };
 
   const handleReset = async (): Promise<void> => {
     await resetDatabase();
-    await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+    await Promise.all([loadBodies(), loadCoats(), loadReadings(), loadStays()]);
     message.success('已清空并重新载入演示数据');
   };
 
@@ -227,10 +231,10 @@ export default function ExportView() {
               {record.defectRoomId === null
                 ? '未指定'
                 : (() => {
-                    const room = rooms.find((item) => item.id === record.defectRoomId);
-                    return room
-                      ? `${room.date} ${room.tempC}℃ / ${room.humidityPct}%（${ROOM_VERDICT_LABEL[room.verdict]}）`
-                      : '记录已删除';
+                    const reading = readings.find((item) => item.id === record.defectRoomId);
+                    return reading
+                      ? `${reading.date} ${reading.sampledAt || '时刻缺'} ${reading.tempC}℃ / ${reading.humidityPct}%（${ENV_VERDICT_LABEL[reading.verdict]}）`
+                      : '读数已删除';
                   })()}
             </Typography.Text>
           </Space>
@@ -306,7 +310,8 @@ export default function ExportView() {
         <StatBadge label="合格率" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
         <StatBadge label="合格" value={stat.pass} suffix="条" tone="info" />
         <StatBadge label="返工" value={stat.rework} suffix="条" tone="danger" />
-        <StatBadge label="荫房记录" value={rooms.length} suffix="条" tone="warning" />
+        <StatBadge label="记录仪读数" value={readings.length} suffix="条" tone="warning" />
+        <StatBadge label="入出房记录" value={stays.length} suffix="条" tone="info" />
       </div>
 
       <Row gutter={16}>
@@ -346,7 +351,7 @@ export default function ExportView() {
             extra={
               <Space size={4}>
                 <Button size="small" icon={<FileTextOutlined />} onClick={() => {
-                  const filename = exportReworkList(bodies, coats, rooms, inspectTable.rows);
+                  const filename = exportReworkList(bodies, coats, readings, inspectTable.rows);
                   message.success(`已导出 ${filename}`);
                 }}>
                   导出清单
@@ -372,7 +377,7 @@ export default function ExportView() {
           <Card title="整库导出" style={{ marginTop: 16 }}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
               <Typography.Text type="secondary">
-                导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+                导出文件包含 7 张业务表（含记录仪读数与入出房分账）全量数据与结构版本号，可在其他设备通过「导入 JSON」还原；v2 旧备份导入时自动拆分升级。
               </Typography.Text>
               <Space wrap>
                 <Button icon={<CloudDownloadOutlined />} onClick={() => void handleExport()}>
@@ -380,7 +385,7 @@ export default function ExportView() {
                 </Button>
                 <Button
                   onClick={() => {
-                    const filename = exportLedgerCsv(bodies, coats, rooms);
+                    const filename = exportLedgerCsv(bodies, coats, readings, stays);
                     message.success(`已导出 ${filename}`);
                   }}
                 >
@@ -454,13 +459,13 @@ export default function ExportView() {
                   }))}
                 />
               </Form.Item>
-              <Form.Item name="defectRoomId" label="关联荫房记录" style={{ flex: 1 }}>
+              <Form.Item name="defectRoomId" label="关联记录仪读数" style={{ flex: 1 }}>
                 <Select
                   allowClear
-                  placeholder="选择荫房记录"
-                  options={draftRooms.map((room) => ({
-                    value: room.id,
-                    label: `${room.date} ${room.tempC}℃/${room.humidityPct}% · ${ROOM_VERDICT_LABEL[room.verdict]}`,
+                  placeholder="选择读数"
+                  options={draftReadings.map((reading) => ({
+                    value: reading.id,
+                    label: `${reading.date} ${reading.sampledAt || '时刻缺'} ${reading.tempC}℃/${reading.humidityPct}% · ${ENV_VERDICT_LABEL[reading.verdict]}`,
                   }))}
                 />
               </Form.Item>
